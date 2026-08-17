@@ -12,6 +12,11 @@ class SchoolUpdate(BaseModel):
     setup: dict = Field(default_factory=dict)
 
 
+class OrganizationCreate(BaseModel):
+    name: str = Field(min_length=2, max_length=200)
+    type: str = Field(default="school", pattern="^(school|college)$")
+
+
 class AbsenceCreate(BaseModel):
     date: str
     teacher: str

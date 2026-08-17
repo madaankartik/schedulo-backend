@@ -1,12 +1,25 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.auth import current_user
 from app.db import get_db
-from app.models import Absence, School
-from app.schemas import AbsenceCreate, SchoolCreate, SchoolUpdate
+from app.models import Absence, Organization, School
+from app.schemas import AbsenceCreate, OrganizationCreate, SchoolCreate, SchoolUpdate
 from app.solver.scheduler import generate_timetable
 
 router = APIRouter(prefix="/api/v1")
+
+
+@router.post("/organizations")
+def create_organization(payload: OrganizationCreate, db: Session = Depends(get_db), user_id: str = Depends(current_user)):
+    school = School(name=payload.name, academic_year="2026–27", setup={}, timetable=[])
+    db.add(school)
+    db.flush()
+    organization = Organization(name=payload.name, type=payload.type, owner_id=user_id, school_id=school.id)
+    db.add(organization)
+    db.commit()
+    db.refresh(organization)
+    return {"id": organization.id, "name": organization.name, "type": organization.type, "school_id": organization.school_id, "academic_year": school.academic_year}
 
 
 @router.post("/schools")

@@ -1,5 +1,5 @@
 """Database model modules."""
 
-from app.models.school import Absence, School
+from app.models.school import Absence, Organization, School
 
-__all__ = ["Absence", "School"]
+__all__ = ["Absence", "Organization", "School"]
