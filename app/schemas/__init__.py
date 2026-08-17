@@ -1,5 +1,5 @@
 """Pydantic request and response schemas."""
 
-from app.schemas.setup import AbsenceCreate, OrganizationCreate, SchoolCreate, SchoolUpdate
+from app.schemas.setup import AbsenceCreate, LoginRequest, OrganizationCreate, SchoolCreate, SignupRequest, SchoolUpdate
 
-__all__ = ["AbsenceCreate", "OrganizationCreate", "SchoolCreate", "SchoolUpdate"]
+__all__ = ["AbsenceCreate", "LoginRequest", "OrganizationCreate", "SchoolCreate", "SignupRequest", "SchoolUpdate"]
