@@ -1,3 +1,4 @@
+import math
 from collections import defaultdict
 
 from ortools.sat.python import cp_model
@@ -49,12 +50,15 @@ def generate_timetable(setup: dict) -> dict:
 
     # Prefer spreading repeated subjects over different days when possible.
     day_subject = defaultdict(list)
+    subject_totals = defaultdict(int)
     for index, activity in enumerate(activities):
+        subject_key = (activity.get("className", "Demo Class A"), activity.get("subject", "Subject"))
+        subject_totals[subject_key] += 1
         for slot, variable in enumerate(variables[index]):
             day = slot // periods
             day_subject[(activity.get("className", "Demo Class A"), activity.get("subject", "Subject"), day)].append(variable)
-    for variables_for_day in day_subject.values():
-        model.Add(sum(variables_for_day) <= 1)
+    for (class_name, subject, _day), variables_for_day in day_subject.items():
+        model.Add(sum(variables_for_day) <= math.ceil(subject_totals[(class_name, subject)] / days))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 10
