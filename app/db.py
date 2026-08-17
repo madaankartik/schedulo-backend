@@ -6,6 +6,10 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{BASE_DIR / 'schedulo.db'}")
+if DATABASE_URL.startswith("postgresql://"):
+    # SQLAlchemy otherwise selects the psycopg2 dialect for this shorthand,
+    # while the project intentionally installs the psycopg v3 driver.
+    DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 engine = create_engine(
     DATABASE_URL,
