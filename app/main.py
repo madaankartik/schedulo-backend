@@ -24,7 +24,7 @@ Base.metadata.create_all(bind=engine)
 app.include_router(router)
 
 
-@app.get("/health", tags=["system"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["system"])
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "schedulo-api"}
 
