@@ -85,7 +85,7 @@ async def google_callback(code: str, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(user)
     frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:5173")
-    return RedirectResponse(f"{frontend_origin}/oauth/callback?token={create_access_token(user.id)}")
+    return RedirectResponse(f"{frontend_origin}/?token={create_access_token(user.id)}")
 
 
 @router.post("/organizations")
