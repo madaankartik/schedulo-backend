@@ -1,4 +1,5 @@
 import os
+from datetime import date as date_cls
 from urllib.parse import urlencode
 
 import httpx
@@ -9,7 +10,7 @@ from sqlalchemy.orm import Session
 from app.auth import create_access_token, current_user, hash_password, verify_password
 from app.db import get_db
 from app.models import Absence, Organization, School, User
-from app.schemas import AbsenceCreate, LoginRequest, OrganizationCreate, SchoolCreate, SignupRequest, SchoolUpdate
+from app.schemas import AbsenceCreate, AbsencePreview, LoginRequest, OrganizationCreate, SchoolCreate, SignupRequest, SchoolUpdate
 from app.solver.scheduler import generate_timetable
 
 router = APIRouter(prefix="/api/v1")
@@ -165,19 +166,310 @@ def get_timetable(school_id: int, db: Session = Depends(get_db)):
     return {"entries": school.timetable or []}
 
 
-@router.post("/schools/{school_id}/absences")
-def create_absence(school_id: int, payload: AbsenceCreate, db: Session = Depends(get_db)):
+@router.get("/schools/{school_id}/absences")
+def get_absence_plan(school_id: int, date: str, db: Session = Depends(get_db)):
     school = db.get(School, school_id)
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
-    affected = [entry for entry in (school.timetable or []) if entry.get("teacher") == payload.teacher]
-    absence = Absence(school_id=school_id, date=payload.date, teacher=payload.teacher, reason=payload.reason, substitutions=[])
-    db.add(absence)
+    day = _day_name(date)
+    saved_rows = (
+        db.query(Absence)
+        .filter(Absence.school_id == school_id, Absence.date == date)
+        .order_by(Absence.id.asc())
+        .all()
+    )
+    if not saved_rows:
+        return _empty_absence_plan(date, day)
+
+    items = saved_rows[0].substitutions or []
+    absences = [
+        {"teacher": row.teacher, "reason": row.reason or ""}
+        for row in saved_rows
+        if row.teacher
+    ]
+    if not items and absences:
+        items = _build_absence_plan(school, AbsencePreview(date=date, absences=absences))[
+            "items"
+        ]
+    return _with_absence_summary(
+        {
+            "date": date,
+            "day": day,
+            "absences": absences,
+            "items": items,
+            "saved": True,
+        }
+    )
+
+
+@router.post("/schools/{school_id}/absences/preview")
+def preview_absence_plan(school_id: int, payload: AbsencePreview, db: Session = Depends(get_db)):
+    school = db.get(School, school_id)
+    if not school:
+        raise HTTPException(status_code=404, detail="School not found")
+    return _build_absence_plan(school, payload)
+
+
+@router.post("/schools/{school_id}/absences")
+def save_absence_plan(school_id: int, payload: AbsenceCreate, db: Session = Depends(get_db)):
+    school = db.get(School, school_id)
+    if not school:
+        raise HTTPException(status_code=404, detail="School not found")
+    plan = _build_absence_plan(school, payload)
+    incoming_substitutions = payload.substitutions or []
+    if incoming_substitutions:
+        incoming_by_key = {
+            _coverage_key(item): item for item in incoming_substitutions if _coverage_key(item)
+        }
+        for item in plan["items"]:
+            incoming = incoming_by_key.get(_coverage_key(item))
+            if not incoming:
+                continue
+            substitute = (incoming.get("substitute") or "").strip()
+            item["substitute"] = substitute
+            item["status"] = "covered" if substitute else "needs_attention"
+            item["reason"] = (
+                incoming.get("reason")
+                or item.get("reason")
+                or ("Manually selected" if substitute else "No substitute selected")
+            )
+        plan = _with_absence_summary(plan)
+
+    (
+        db.query(Absence)
+        .filter(Absence.school_id == school_id, Absence.date == payload.date)
+        .delete(synchronize_session=False)
+    )
+    for absence in plan["absences"]:
+        db.add(
+            Absence(
+                school_id=school_id,
+                date=payload.date,
+                teacher=absence["teacher"],
+                reason=absence.get("reason", ""),
+                substitutions=plan["items"],
+            )
+        )
     db.commit()
-    return {"id": absence.id, "date": payload.date, "teacher": payload.teacher, "affected": affected, "candidates": _substitute_candidates(school, payload.teacher, affected)}
+    plan["saved"] = True
+    return plan
 
 
-def _substitute_candidates(school: School, absent_teacher: str, affected: list[dict]) -> list[str]:
-    teachers = {item.get("teacher") for item in (school.setup or {}).get("assignments", []) if item.get("teacher") and item.get("teacher") != absent_teacher}
-    busy = {item.get("teacher") for item in (school.timetable or []) if item.get("period") in {entry.get("period") for entry in affected}}
-    return sorted(teacher for teacher in teachers if teacher not in busy)
+def _day_name(date_text: str) -> str:
+    try:
+        return date_cls.fromisoformat(date_text).strftime("%A")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Date must use YYYY-MM-DD format") from exc
+
+
+def _empty_absence_plan(date: str, day: str) -> dict:
+    return {
+        "date": date,
+        "day": day,
+        "absences": [],
+        "items": [],
+        "summary": {
+            "absentTeachers": 0,
+            "totalAffected": 0,
+            "covered": 0,
+            "needsAttention": 0,
+        },
+        "saved": False,
+    }
+
+
+def _normalise_absences(payload: AbsencePreview) -> list[dict]:
+    rows = [
+        {"teacher": item.teacher.strip(), "reason": item.reason.strip()}
+        for item in payload.absences
+        if item.teacher.strip()
+    ]
+    if payload.teacher and payload.teacher.strip():
+        rows.append(
+            {
+                "teacher": payload.teacher.strip(),
+                "reason": payload.reason.strip(),
+            }
+        )
+    seen = set()
+    normalised = []
+    for row in rows:
+        key = row["teacher"].casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalised.append(row)
+    return normalised
+
+
+def _teacher_names(school: School) -> list[str]:
+    setup = school.setup or {}
+    names = [
+        (teacher.get("name") or "").strip()
+        for teacher in setup.get("teachers", [])
+        if (teacher.get("name") or "").strip()
+    ]
+    names.extend(
+        (assignment.get("teacher") or "").strip()
+        for assignment in setup.get("assignments", [])
+        if (assignment.get("teacher") or "").strip()
+    )
+    return list(dict.fromkeys(names))
+
+
+def _teacher_assignments(school: School, teacher: str | None = None) -> list[dict]:
+    assignments = [
+        item
+        for item in (school.setup or {}).get("assignments", [])
+        if item.get("teacher")
+    ]
+    if teacher is None:
+        return assignments
+    return [item for item in assignments if item.get("teacher") == teacher]
+
+
+def _coverage_key(item: dict) -> tuple | None:
+    day = item.get("day")
+    period = item.get("period")
+    class_name = item.get("className")
+    subject = item.get("subject")
+    absent_teacher = item.get("absentTeacher")
+    if not all([day, period, class_name, subject, absent_teacher]):
+        return None
+    return day, period, class_name, subject, absent_teacher
+
+
+def _candidate_reason(teaches_subject: bool, teaches_class: bool, daily_load: int) -> str:
+    reasons = []
+    if teaches_subject:
+        reasons.append("teaches this subject")
+    if teaches_class:
+        reasons.append("knows this class")
+    reasons.append(f"{daily_load} base periods that day")
+    return ", ".join(reasons)
+
+
+def _rank_candidates(
+    school: School,
+    target_day: str,
+    affected_entry: dict,
+    absent_names: set[str],
+    planned_busy: dict[int, set[str]],
+    planned_sub_loads: dict[str, int],
+) -> list[dict]:
+    period = affected_entry.get("period")
+    timetable = school.timetable or []
+    busy = {
+        item.get("teacher")
+        for item in timetable
+        if item.get("day") == target_day and item.get("period") == period and item.get("teacher")
+    }
+    busy |= planned_busy.get(period, set())
+    candidates = []
+    for teacher in _teacher_names(school):
+        if teacher in absent_names or teacher in busy:
+            continue
+        teacher_rows = _teacher_assignments(school, teacher)
+        teaches_subject = any(
+            row.get("subject") == affected_entry.get("subject") for row in teacher_rows
+        )
+        teaches_class = any(
+            row.get("className") == affected_entry.get("className") for row in teacher_rows
+        )
+        daily_load = sum(
+            1
+            for item in timetable
+            if item.get("day") == target_day and item.get("teacher") == teacher
+        )
+        score = 20
+        if teaches_subject:
+            score += 70
+        if teaches_class:
+            score += 25
+        score -= daily_load * 2
+        score -= planned_sub_loads.get(teacher, 0) * 5
+        candidates.append(
+            {
+                "teacher": teacher,
+                "score": score,
+                "reason": _candidate_reason(teaches_subject, teaches_class, daily_load),
+            }
+        )
+    return sorted(candidates, key=lambda item: (-item["score"], item["teacher"]))
+
+
+def _build_absence_plan(school: School, payload: AbsencePreview) -> dict:
+    day = _day_name(payload.date)
+    absences = _normalise_absences(payload)
+    absent_names = {item["teacher"] for item in absences}
+    if not absences:
+        return _empty_absence_plan(payload.date, day)
+
+    timetable = school.timetable or []
+    affected_entries = [
+        entry
+        for entry in timetable
+        if entry.get("day") == day and entry.get("teacher") in absent_names
+    ]
+    affected_entries.sort(
+        key=lambda entry: (
+            int(entry.get("period") or 0),
+            entry.get("className", ""),
+            entry.get("subject", ""),
+        )
+    )
+
+    planned_busy: dict[int, set[str]] = {}
+    planned_sub_loads: dict[str, int] = {}
+    items = []
+    for entry in affected_entries:
+        period = int(entry.get("period") or 0)
+        candidates = _rank_candidates(
+            school,
+            day,
+            entry,
+            absent_names,
+            planned_busy,
+            planned_sub_loads,
+        )
+        chosen = candidates[0] if candidates else None
+        substitute = chosen["teacher"] if chosen else ""
+        if substitute:
+            planned_busy.setdefault(period, set()).add(substitute)
+            planned_sub_loads[substitute] = planned_sub_loads.get(substitute, 0) + 1
+        items.append(
+            {
+                "day": entry.get("day"),
+                "period": period,
+                "className": entry.get("className"),
+                "subject": entry.get("subject"),
+                "absentTeacher": entry.get("teacher"),
+                "substitute": substitute,
+                "status": "covered" if substitute else "needs_attention",
+                "reason": chosen["reason"] if chosen else "No free teacher found for this period",
+                "candidates": candidates[:6],
+                "sourceEntry": entry,
+            }
+        )
+
+    return _with_absence_summary(
+        {
+            "date": payload.date,
+            "day": day,
+            "absences": absences,
+            "items": items,
+            "saved": False,
+        }
+    )
+
+
+def _with_absence_summary(plan: dict) -> dict:
+    items = plan.get("items", [])
+    covered = sum(1 for item in items if item.get("status") == "covered")
+    plan["summary"] = {
+        "absentTeachers": len(plan.get("absences", [])),
+        "totalAffected": len(items),
+        "covered": covered,
+        "needsAttention": max(0, len(items) - covered),
+    }
+    return plan

@@ -25,10 +25,20 @@ class OrganizationCreate(BaseModel):
     academic_year: str = Field(default_factory=default_academic_year, max_length=30)
 
 
-class AbsenceCreate(BaseModel):
-    date: str
-    teacher: str
+class AbsenceTeacher(BaseModel):
+    teacher: str = Field(min_length=1, max_length=200)
     reason: str = ""
+
+
+class AbsencePreview(BaseModel):
+    date: str
+    teacher: str | None = None
+    reason: str = ""
+    absences: list[AbsenceTeacher] = Field(default_factory=list)
+
+
+class AbsenceCreate(AbsencePreview):
+    substitutions: list[dict] = Field(default_factory=list)
 
 
 class SignupRequest(BaseModel):
