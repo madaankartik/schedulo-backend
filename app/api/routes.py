@@ -11,7 +11,7 @@ from app.auth import create_access_token, current_user, hash_password, verify_pa
 from app.db import get_db
 from app.models import Absence, Organization, School, User
 from app.schemas import AbsenceCreate, AbsencePreview, LoginRequest, OrganizationCreate, SchoolCreate, SignupRequest, SchoolUpdate
-from app.solver.scheduler import generate_timetable
+from app.solver.scheduler import generate_timetable, move_timetable_entry, validate_timetable_entries
 
 router = APIRouter(prefix="/api/v1")
 
@@ -128,7 +128,15 @@ def get_school(school_id: int, db: Session = Depends(get_db)):
     school = db.get(School, school_id)
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
-    return {"id": school.id, "name": school.name, "academic_year": school.academic_year, "setup": school.setup, "timetable": school.timetable}
+    setup = school.setup or {}
+    return {
+        "id": school.id,
+        "name": school.name,
+        "academic_year": school.academic_year,
+        "setup": setup,
+        "timetable": school.timetable or [],
+        "draft_timetable": setup.get("draftTimetable"),
+    }
 
 
 @router.put("/schools/{school_id}/setup")
@@ -153,7 +161,14 @@ def generate_school_timetable(school_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="School not found")
     result = generate_timetable(school.setup or {})
     if result["status"] != "INFEASIBLE":
-        school.timetable = result["entries"]
+        result = {
+            **result,
+            "mode": "draft",
+            "message": "Draft generated. Save it as current when you are happy with it.",
+        }
+        setup = dict(school.setup or {})
+        setup["draftTimetable"] = result
+        school.setup = setup
         db.commit()
     return result
 
@@ -163,7 +178,68 @@ def get_timetable(school_id: int, db: Session = Depends(get_db)):
     school = db.get(School, school_id)
     if not school:
         raise HTTPException(status_code=404, detail="School not found")
-    return {"entries": school.timetable or []}
+    setup = school.setup or {}
+    return {"entries": school.timetable or [], "draft": setup.get("draftTimetable")}
+
+
+@router.post("/schools/{school_id}/timetable/save-draft")
+def save_draft_timetable(school_id: int, db: Session = Depends(get_db)):
+    school = db.get(School, school_id)
+    if not school:
+        raise HTTPException(status_code=404, detail="School not found")
+    setup = dict(school.setup or {})
+    draft = setup.get("draftTimetable") or {}
+    entries = draft.get("entries") or []
+    if not entries:
+        raise HTTPException(status_code=400, detail="Generate a draft timetable before saving.")
+    validation = validate_timetable_entries(entries, setup)
+    if not validation["ok"]:
+        raise HTTPException(status_code=409, detail=validation["errors"])
+    school.timetable = entries
+    setup["savedTimetableMeta"] = {
+        "source": "draft",
+        "entries": len(entries),
+        "status": draft.get("status", "SAVED"),
+    }
+    school.setup = setup
+    db.commit()
+    return {"status": "SAVED", "entries": school.timetable, "draft": draft}
+
+
+@router.post("/schools/{school_id}/timetable/validate")
+def validate_timetable(school_id: int, payload: dict, db: Session = Depends(get_db)):
+    school = db.get(School, school_id)
+    if not school:
+        raise HTTPException(status_code=404, detail="School not found")
+    source = payload.get("source", "current")
+    entries = _entries_for_source(school, source)
+    return validate_timetable_entries(entries, school.setup or {})
+
+
+@router.patch("/schools/{school_id}/timetable/move")
+def move_timetable_slot(school_id: int, payload: dict, db: Session = Depends(get_db)):
+    school = db.get(School, school_id)
+    if not school:
+        raise HTTPException(status_code=404, detail="School not found")
+    source = payload.get("source", "draft")
+    entries = _entries_for_source(school, source)
+    if not entries:
+        raise HTTPException(status_code=400, detail="No timetable entries are available to edit.")
+    result = move_timetable_entry(entries, school.setup or {}, payload)
+    if not result["ok"]:
+        return {"ok": False, "entries": entries, "errors": result["errors"]}
+    if source == "current":
+        school.timetable = result["entries"]
+    else:
+        setup = dict(school.setup or {})
+        draft = dict(setup.get("draftTimetable") or {})
+        draft["entries"] = result["entries"]
+        draft["mode"] = "draft"
+        draft["edited"] = True
+        setup["draftTimetable"] = draft
+        school.setup = setup
+    db.commit()
+    return {"ok": True, "entries": result["entries"], "source": source}
 
 
 @router.get("/schools/{school_id}/absences")
@@ -253,6 +329,14 @@ def save_absence_plan(school_id: int, payload: AbsenceCreate, db: Session = Depe
     db.commit()
     plan["saved"] = True
     return plan
+
+
+def _entries_for_source(school: School, source: str) -> list[dict]:
+    if source == "current":
+        return school.timetable or []
+    setup = school.setup or {}
+    draft = setup.get("draftTimetable") or {}
+    return draft.get("entries") or []
 
 
 def _day_name(date_text: str) -> str:
